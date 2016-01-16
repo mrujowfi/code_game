@@ -10,7 +10,8 @@ import traceback
 import datetime
 
 '''
-增加气眼检测
+气眼检测
+波纹探测墙
 '''
 global arg, line, row, house, house_list, start_line, start_row, history, failed_set, driver, num_map
 
