@@ -12,6 +12,8 @@ import datetime
 '''
 气眼检测
 波纹探测墙
+增加气眼检测
+win更新
 '''
 global arg, line, row, house, house_list, start_line, start_row, history, failed_set, driver, num_map
 
