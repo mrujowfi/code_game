@@ -12,8 +12,8 @@ import datetime
 '''
 气眼检测
 波纹探测墙
-增加气眼检测
-win更新
+波纹探测岛
+探索顺序3,2,4,1
 '''
 global arg, line, row, house, house_list, start_line, start_row, history, failed_set, driver, num_map
 
@@ -347,7 +347,7 @@ def start():
     global arg, line, row, house, house_list, start_line, start_row, history, failed_set, driver, num_map
 
     #origin_house at house_list[0]
-    house_list.append((copy.deepcopy(house), num_map))
+    house_list.append((copy.deepcopy(house), copy.deepcopy(num_map)))
     #print travel(2, 2, 1)
     '''
     history = ''
@@ -355,9 +355,44 @@ def start():
         url = 'http://www.qlcoder.com/train/crcheck?x='+str(2+1)+'&y='+str(2+1)+'&path='+history
         print url
     '''
+    print 'search 3'
     for i in range(line):
         for j in range(row):
-            if house[i][j] >= 0:
+            if house[i][j] == 3:
+                #print '%d,%d\r' % (i, j),
+                #print 'walk', i, j
+                history = ''
+                if travel(i, j, 1):
+                    url = 'http://www.qlcoder.com/train/crcheck?x='+str(i+1)+'&y='+str(j+1)+'&path='+history
+                    print url
+                    return url
+    timing.stop()
+
+    print 'search 2'
+    timing.start()
+    del house_list[:]
+    house_list = []
+    house_list.append((copy.deepcopy(house), copy.deepcopy(num_map)))
+    for i in range(line):
+        for j in range(row):
+            if house[i][j] == 2:
+                #print '%d,%d\r' % (i, j),
+                #print 'walk', i, j
+                history = ''
+                if travel(i, j, 1):
+                    url = 'http://www.qlcoder.com/train/crcheck?x='+str(i+1)+'&y='+str(j+1)+'&path='+history
+                    print url
+                    return url
+    timing.stop()
+
+    print 'search 1,4'
+    timing.start()
+    del house_list[:]
+    house_list = []
+    house_list.append((copy.deepcopy(house), copy.deepcopy(num_map)))
+    for i in range(line):
+        for j in range(row):
+            if house[i][j] == 4 or house[i][j] == 1:
                 #print '%d,%d\r' % (i, j),
                 #print 'walk', i, j
                 history = ''
