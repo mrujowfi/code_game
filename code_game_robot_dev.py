@@ -792,7 +792,11 @@ def driver_getQuestion():
         driver_login()
         return driver_getQuestion()
     else:
+<<<<<<< HEAD
         question = content.split('\n')[6]  # mac
+=======
+        question = content.split('\n')[6]
+>>>>>>> origin/master
         print question.encode('utf-8')
         return question
 
