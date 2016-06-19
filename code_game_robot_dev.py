@@ -792,7 +792,9 @@ def driver_getQuestion():
         driver_login()
         return driver_getQuestion()
     else:
-        return content.split('\n')[0]
+        question = content.split('\n')[6]  # mac
+        print question.encode('utf-8')
+        return question
 
 
 def driver_sendAnswer(ans):
