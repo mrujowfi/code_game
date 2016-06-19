@@ -838,6 +838,7 @@ level=112&x=40&y=41&map=00010011110001100110000000000111001110001010000110001011
     except Exception, e:
         timing.stop()
         print 'error', e
+        time.sleep(1)
         print traceback.format_exc()
     if dev is False:
         driver_quit()
