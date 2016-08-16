@@ -1,4 +1,3 @@
-
 #!python
 #!/usr/bin/env python
 
@@ -41,7 +40,7 @@ def array_format_to_dtype(af):
     else:
         raise TypeError(
                 "cannot convert array_format '%s' to a numpy dtype"
-                % array_format)
+                % af)
 
 #
 # numpy3d_to_array
@@ -110,7 +109,7 @@ def array_to_numpy3d(cuda_array):
     return numpy_array
 
 
-src_module=ur'''
+src_module=r'''
 #include <stdint.h>
 #include <cuda.h>
 #include <surface_functions.h>
@@ -170,4 +169,3 @@ kernel.prepared_call(grid, block, shape_z, shape_y, shape_x)
 
 numpy_array_out = array_to_numpy3d(cuda_array_out)
 numpy.testing.assert_array_almost_equal(numpy_array_out, numpy_array_in)
-
