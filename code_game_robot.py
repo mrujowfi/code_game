@@ -9,7 +9,7 @@ import multiprocessing
 import copy
 import ctypes
 
-g_version = 'v2.4.1'
+g_version = 'v2.4.2'
 '''
 气眼检测 v1.0
 波纹探测墙 v1.1
@@ -19,6 +19,7 @@ g_version = 'v2.4.1'
 改成进程类实现单机多进程 v2.3
 效果拔群... v2.3.2
 进程共享残影图 v2.4.1
+可视进度 v2.4.2
 '''
 
 global driver
@@ -47,20 +48,24 @@ class ProcRobot(multiprocessing.Process):
         self.data_lock = dict_args['data_lock']
         self.start_time = ''
         self.end_time = ''
+        if self.reverse == 0:
+            self.queue = dict_args['queue']
+        elif self.reverse == 1:
+            self.queue = dict_args['queue_reverse']
+        self.start_pos = dict_args['start_pos'][self.reverse]
 
     def run(self):
         print str(self.pid)+' ('+str(self.mission_type)+', '+str(self.reverse)+') '+self.name+' start '
         try:
             self.init(self.arg)
-            ans = self.robotStart(self.mission_type, self.reverse)
+            ans = self.robotStart()
             if ans is not None:
-                print '(%d, %d) is ok' % (self.mission_type, self.reverse)
                 self.data_lock.acquire()
                 self.result.put(ans)
                 self.data_lock.release()
                 self.end_time = datetime.datetime.now()
                 print 'lv:%s %s -> %s' % (self.level, self.start_time.strftime("%Y%m%d-%H%M%S.%f"), self.end_time.strftime("%Y%m%d-%H%M%S.%f"))
-                print 'lv:%s (%d, %d) %s: %.2f mins, %d wa_lks, avg: %.2f seconds,  %.2f mins' % (self.level, self.mission_type, self.reverse, g_version, self.sum_second/float(60), self.sum_walk, self.sum_second*1.0/self.sum_walk, (self.end_time-self.start_time).seconds/60.0)
+                print 'lv:%s (%d, %d) %s: %.2f mins, %d wa_lks, avg: %.2f seconds,  %s' % (self.level, self.mission_type, self.reverse, g_version, self.sum_second/float(60), self.sum_walk, self.sum_second*1.0/self.sum_walk, (self.end_time-self.start_time))
         except Exception, e:
             print 'error', e
             time.sleep(1)
@@ -97,13 +102,35 @@ class ProcRobot(multiprocessing.Process):
                 if self.house[i][j] >= 0:
                     self.posCount(self.house, i, j, self.num_map, True)
 
+        i_range = range(self.line)
+        j_range = range(self.row)
+        queue_list = [(i, j) for i in i_range for j in j_range]
+        if self.reverse == 1:
+            queue_list.reverse()
+        walk_list = list()
+        for each in queue_list:
+            i, j = each
+            if self.house[i][j] != -1:
+                walk_list.append(each)
+
+        self.total_queue = len(walk_list)
+
+        if self.mission_type != 0 or self.reverse != 0:
+            time.sleep(1)
+        self.data_lock.acquire()
+        if self.queue.qsize() == 0:
+            for k in range(len(walk_list)):
+                if k < self.start_pos:
+                    continue
+                self.queue.put(walk_list[k])
 
         self.start_time = datetime.datetime.now()
-        if self.mission_type == 3 and self.reverse == 0:
+        if self.mission_type == 0 and self.reverse == 0:
             print 'lv:%s start time: %s' % (self.level, self.start_time.strftime("%Y%m%d-%H%M%S.%f"))
             print self.arg
             print self.line, self.row
             self.print_house(self.house)
+        self.data_lock.release()
 
 
     def print_house(self, temp_house):
@@ -396,13 +423,14 @@ class ProcRobot(multiprocessing.Process):
             result_size = self.result.qsize()
             self.data_lock.release()
             if result_size == 1:
+                # print self.name + ' other'
                 return False
 
         #possibly
         return None
 
 
-    def robotStart(self, mission_type, reverse):
+    def robotStart(self):
 
         #origin_house at self.house_list[0]
 
@@ -420,28 +448,37 @@ class ProcRobot(multiprocessing.Process):
         # print 'search '+str(mission_type)+' '+str(reverse)
         timing.start()
         self.house_list.append((copy.deepcopy(self.house), copy.deepcopy(self.num_map)))
-        i_range = range(self.line)
-        j_range = range(self.row)
-        if reverse == 1:
-            i_range.reverse()
-            j_range.reverse()
-        for i in i_range:
-            for j in j_range:
-                self.data_lock.acquire()
-                result_size = self.result.qsize()
+
+        while True:
+            i, j = (-1, -1)
+            self.data_lock.acquire()
+            result_size = self.result.qsize()
+            queue_size = self.queue.qsize()
+            if queue_size > 0:
+                i, j = self.queue.get()
                 self.data_lock.release()
-                if self.house[i][j] == int(mission_type) and result_size == 0:
-                    self.sum_walk += 1
-                    # print '%d,%d\r' % (i, j),
-                    print '(%d, %d) walk %d %d' % (self.mission_type, self.reverse, i, j)
-                    self.history = ''
-                    result = self.travel_first(i, j, 1)
-                    if result[0]:
-                        url = 'http://www.qlcoder.com/train/crcheck?x='+str(i+1)+'&y='+str(j+1)+'&path='+self.history
-                        print url
-                        self.sum_second += timing.stop()
-                        return url
-        self.sum_second += timing.stop()
+            else:
+                self.data_lock.release()
+                print self.name+' break1'
+                break
+
+            if i != -1 and j != -1 and result_size == 0:
+                self.sum_walk += 1
+                # print '%d,%d\r' % (i, j),
+                print '(%d, %d)\twalk\t%d, %d\t%s%d/%d' \
+                      % (self.mission_type, self.reverse, i, j,
+                         '+' if self.reverse == 0 else '-', self.total_queue-queue_size, self.total_queue)
+                self.history = ''
+                result = self.travel_first(i, j, 1)
+                if result[0]:
+                    url = 'http://www.qlcoder.com/train/crcheck?x='+str(i+1)+'&y='+str(j+1)+'&path='+self.history
+                    print url
+                    self.sum_second += timing.stop(bPrint=False)
+                    return url
+            else:
+                print self.name+' break2'
+                break
+        self.sum_second += timing.stop(bPrint=False)
 
         return None
 
@@ -835,82 +872,89 @@ def driver_sendAnswer(ans):
         driver_sendAnswer(ans)
 
 
+def make_args(dev, turn_index):
+    result = dict()
+    result['result'] = multiprocessing.Queue(maxsize=5)
+    result['data_lock'] = multiprocessing.RLock()
+    if dev:
+        result['arg'] = '''
+level=102&x=37&y=37&map=0010000000100111110000111000011000100001011000010000001011000100000001010000001100011000100001110011111100101000100000000100010100011011001100010100000110001000100000100000100010101000010011000100000110000001010101010000010001100010000111000110000010001100001000000111001001001000000011000010100000101110000010101101110000000100010100000100000100000110000000001000001010000100010011011001110011100000000100000000100011001000100001000111001111111110011001100001000000101100100000000110001100100011000000010110000111000010010001110101101100001000010000001001000000000010000110110010000001100111000000100111001000011100000010000000001111110011100100110011010001001111000001000001110011000000101010000111001110000110001000110001000101111000101110001000010101011010011000001111000001010000000010100101101000110111000110100011001000011010110101000000101111000001100111001100011010111000000110000000110001000100000100011000010000000111110010001000111000011101100000010000110011100000100000000000100010001000001000000100010100001000000100000100010000010000100010000000001100000011101100001110000000110001000000111100000000100111000000010010001100001111100110000111100000011000001000110010000110010011110001101000010001010001010011000011111000000001111000000011001000001000001100010001000100001110001101000001110000100011101001100010000100100000000000000000000110000100010010000
+'''
+    else:
+        result['arg'] = driver_getQuestion()
+    arg = result['arg'][:50]
+    line = int(arg.split('&')[1].split('=')[1])
+    row = int(arg.split('&')[2].split('=')[1])
+    result['shadow'] = multiprocessing.Array(ctypes.c_byte, [15 for i in range(line*row)])
+
+    result['queue'] = multiprocessing.Queue(maxsize=-1)
+    result['queue_reverse'] = multiprocessing.Queue(maxsize=-1)
+    if turn_index == 0:
+        result['start_pos'] = (52, 780)
+    else:
+        result['start_pos'] = (0, 0)
+    print 'start_pos: %d, %d' % (result['start_pos'][0], result['start_pos'][1])
+
+    return result
+
+
+
 if __name__ == '__main__':
     dev = False
     if dev is False:
         driver_init()
     try:
-        if dev:
-            dict_args = {}
-            dict_args['result'] = multiprocessing.Queue(maxsize=5)
-            dict_args['data_lock'] = multiprocessing.RLock()
-            dict_args['arg'] = '''
-level=106&x=38&y=39&map=000000100110011000010000000000000000000000010000100011001000000100010001000010100000010001001101101000001000100010000101101011111100001100000001111111000101001001000000000010000000000000000000101011000110000010000100001000000000100101000010010001000101101100010011000100100001000011000000100100000111000001000110000110000010000110000010000010001000100000110000111111110011000110011100011001111111100001110010000010000111111010011000000001001110000100000110011111010000000011001000010100000100111000111000110001000010011000100010001000110000000000001001000111001111011001010000011100011111000000011111110011000000111001001100100010000010000000110010100000001000100001100100000000011110000001000000010000011001001101111000010001000011111000010011000011100111111010000000111000001000000000111110000100010000110011011101001001000100100000100110100001000000101000111001100001000010010001000000100001000111101101100011001011000010000001000100100001100000111100000011110100000010000000011000010111000100000000111110011000010001000000000011100110001110010000000010100000001110011110000100010000101111000100111100000011111000000000100001000111100100000001000100000010001001000010000100101000100010100100000100011110010010000000011111010000100100000001100010000111010000000010010010000010100001010100001000000001110001000011010010000000001000000010001110100100011000010000101010011111110111100110001001000001000001010000111110000100010000100000100001000000000111110010000010010000110000100000
-'''
-            arg = dict_args['arg'][:50]
-            line = int(arg.split('&')[1].split('=')[1])
-            row = int(arg.split('&')[2].split('=')[1])
-            dict_args['shadow'] = multiprocessing.Array(ctypes.c_byte, [15 for i in range(line*row)])
+        m = 0
+        for i in range(100):
+            dict_args = make_args(dev, i)
+
             #create processes
             processed = []
-            for i in [3, 4, 2, 1]:
-                dict_args['mission_type'] = i
+            for j in range(3):
+                dict_args['mission_type'] = j
                 dict_args['reverse'] = 0
                 processed.append(ProcRobot(dict_args))
                 dict_args['reverse'] = 1
                 processed.append(ProcRobot(dict_args))
 
             #start processes
-            for i in range(len(processed)):
-                processed[i].start()
-                time.sleep(1)
+            for k in range(len(processed)):
+                processed[k].daemon = True
+                processed[k].start()
+                # time.sleep(1)
 
             #join processes
-            for i in range(len(processed)):
-                processed[i].join()
+            # for i in range(len(processed)):
+            #     processed[i].join()
 
-            dict_args['data_lock'].acquire()
+            # why always last proc failed to kill himself...
+            while True:
+                time.sleep(15)
+                alive = 0
+                index = -1
+                for l in range(len(processed)):
+                    if processed[l].is_alive():
+                        index = l
+                        alive += 1
+                if alive == 0:
+                    break
+                elif alive == 1:
+                    processed[index].terminate()
+                    break
+                else:
+                    print 'walk alive %d %d' % (alive, m)
+                m += 1
+
+            ans = ''
             if dict_args['result'].qsize() == 1:
                 ans = dict_args['result'].get()
-                print 'driver_sendAnswer(ans)'
             else:
                 print 'all failed'
-            dict_args['data_lock'].release()
-        else:
-            while True:
-                dict_args = {}
-                dict_args['result'] = multiprocessing.Queue(maxsize=5)
-                dict_args['data_lock'] = multiprocessing.RLock()
-                dict_args['arg'] = driver_getQuestion()
-                arg = dict_args['arg'][:50]
-                line = int(arg.split('&')[1].split('=')[1])
-                row = int(arg.split('&')[2].split('=')[1])
-                dict_args['shadow'] = multiprocessing.Array(ctypes.c_byte, [15 for i in range(line*row)])
-                #create processes
-                processed = []
-                for i in [3, 4, 2, 1]:
-                    dict_args['mission_type'] = i
-                    dict_args['reverse'] = 0
-                    processed.append(ProcRobot(dict_args))
-                    dict_args['reverse'] = 1
-                    processed.append(ProcRobot(dict_args))
 
-                #start processes
-                for i in range(len(processed)):
-                    processed[i].start()
-                    time.sleep(1)
-
-                #join processes
-                for i in range(len(processed)):
-                    processed[i].join()
-
-                dict_args['data_lock'].acquire()
-                if dict_args['result'].qsize() == 1:
-                    ans = dict_args['result'].get()
-                    driver_sendAnswer(ans)
-                else:
-                    print 'all failed'
-                dict_args['data_lock'].release()
+            if dev:
+                break
+            elif ans != '':
+                driver_sendAnswer(ans)
 
     except Exception, e:
         print 'error', e
