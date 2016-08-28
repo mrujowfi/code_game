@@ -8,8 +8,10 @@ import datetime
 import multiprocessing
 import copy
 import ctypes
+import random
+import json
 
-g_version = 'v2.4.2'
+g_version = 'v3.0.0'
 '''
 气眼检测 v1.0
 波纹探测墙 v1.1
@@ -20,16 +22,21 @@ g_version = 'v2.4.2'
 效果拔群... v2.3.2
 进程共享残影图 v2.4.1
 可视进度 v2.4.2
+加入坐标权重, 废除初级残影检测 v3.0.0
 '''
 
 global driver
 
 
+class Point(ctypes.Structure):
+    _fields_ = [('line', ctypes.c_int32), ('row', ctypes.c_int32), ('count', ctypes.c_int32)]  # count for wall
+
+
 class ProcRobot(multiprocessing.Process):
-    def __init__(self, dict_args):
+    def __init__(self, args):
         multiprocessing.Process.__init__(self)
         self.globalArgs = dict()
-        self.arg = dict_args['arg']
+        self.arg = args['arg']
         self.level = 0
         self.line = 0
         self.row = 0
@@ -39,37 +46,65 @@ class ProcRobot(multiprocessing.Process):
         self.history = 0
         self.num_map = 0
         # each shadow position is 0b****1111, means can start walking (up, down, left, right)
-        self.shadow = dict_args['shadow']
+        self.shadow = args['shadow']
         self.sum_second = 0
-        self.sum_walk = 0
-        self.mission_type = int(dict_args['mission_type'])
-        self.reverse = int(dict_args['reverse'])
-        self.result = dict_args['result']
-        self.data_lock = dict_args['data_lock']
+        self.sum_walk = args['sum_walk']
+        self.mission_type = int(args['mission_type'])
+        self.reverse = int(args['reverse'])
+        self.result = args['result']
+        self.data_lock = args['data_lock']
         self.start_time = ''
         self.end_time = ''
         if self.reverse == 0:
-            self.queue = dict_args['queue']
+            self.queue = args['queue']
         elif self.reverse == 1:
-            self.queue = dict_args['queue_reverse']
-        self.start_pos = dict_args['start_pos'][self.reverse]
+            self.queue = args['queue_reverse']
+        self.start_pos = args['start_pos'][self.reverse]
+        self.score = 0
+        self.count_wall = args['count_wall']
+        self.syn = args['syn']
+        self.q_wc = args['q_wc']  # wait count
+        self.q_hc = args['q_hc']  # have counted
+        self.n_wp = args['n_wp']  # length of q_wp
+        self.q_wp = args['q_wp']  # wait for picking
+        self.n_hp = args['n_hp']  # length of q_hp
+        self.q_hp = args['q_hp']  # have picked (useless...)
+        self.walk_list = None  # check if a pos is valid
+        self.rule = args['rule']
+        self.proc_num = args['proc_num']
+        self.wait_num = args['wait_num']
+        self.test_num = 0
+        self.percent = args['percent']
+        self.total_queue = 0
 
     def run(self):
         print str(self.pid)+' ('+str(self.mission_type)+', '+str(self.reverse)+') '+self.name+' start '
         try:
             self.init(self.arg)
-            ans = self.robotStart()
-            if ans is not None:
-                self.data_lock.acquire()
-                self.result.put(ans)
-                self.data_lock.release()
-                self.end_time = datetime.datetime.now()
-                print 'lv:%s %s -> %s' % (self.level, self.start_time.strftime("%Y%m%d-%H%M%S.%f"), self.end_time.strftime("%Y%m%d-%H%M%S.%f"))
-                print 'lv:%s (%d, %d) %s: %.2f mins, %d wa_lks, avg: %.2f seconds,  %s' % (self.level, self.mission_type, self.reverse, g_version, self.sum_second/float(60), self.sum_walk, self.sum_second*1.0/self.sum_walk, (self.end_time-self.start_time))
+            while True:
+                value = self.get_value()
+                ans = self.proc_q_wc()
+                if ans is not None:
+                    self.data_lock.acquire()
+                    self.result.put(ans)
+                    self.syn.value = 4
+                    self.data_lock.release()
+                    self.end_time = datetime.datetime.now()
+                    print 'lv:%s, (%d, %d) %s, %d procs, %d/%d wa_lks, p:%.2f, avg: %.2f seconds,  %s' % (
+                        self.level, self.mission_type, self.reverse, g_version, self.proc_num,
+                        self.sum_walk.value, self.total_queue, self.percent,
+                        (self.end_time-self.start_time).seconds/float(self.sum_walk.value),
+                        (self.end_time-self.start_time)
+                    )
+                    self.print_array(self.q_hc)
+                if self.syn.value == 4:
+                    break
         except Exception, e:
             print 'error', e
             time.sleep(1)
             print traceback.format_exc()
+        with self.wait_num.get_lock():
+            self.wait_num.value += 1
         print str(self.pid)+' ('+str(self.mission_type)+', '+str(self.reverse)+') '+self.name+' stop '
 
     def init(self, question):
@@ -84,9 +119,8 @@ class ProcRobot(multiprocessing.Process):
         sys.setrecursionlimit(1000*self.line*self.row)
         self.num_map = {'num_-1': 0, 'num_0': 0, 'num_1': 0, 'num_2': 0, 'num_3': 0, 'num_4': 0}
         self.sum_second = 0
-        self.sum_walk = 0
 
-        #init each position
+        # init each position
         for each in range(len(self.pos)):
             j = each%self.row
             i = (each-j)/self.row
@@ -96,58 +130,121 @@ class ProcRobot(multiprocessing.Process):
             else:
                 self.house[i][j] = 0
 
-        #count position value
+        # count position value
         for i in range(self.line):
             for j in range(self.row):
                 if self.house[i][j] >= 0:
-                    self.posCount(self.house, i, j, self.num_map, True)
+                    self.pos_count(self.house, i, j, self.num_map, True)
 
         i_range = range(self.line)
         j_range = range(self.row)
         queue_list = [(i, j) for i in i_range for j in j_range]
         if self.reverse == 1:
             queue_list.reverse()
-        walk_list = list()
+        self.walk_list = list()
         for each in queue_list:
             i, j = each
             if self.house[i][j] != -1:
-                walk_list.append(each)
+                self.walk_list.append(each)
 
-        self.total_queue = len(walk_list)
+        self.total_queue = len(self.walk_list)
+        # 5% percent of not any test points nearby(9*9) the result point
+        self.test_num = ProcRobot.make_test(self.line, self.row, self.percent)
 
         if self.mission_type != 0 or self.reverse != 0:
-            time.sleep(1)
+            time.sleep(1)  # stop ohter proc, while (0, 0) init shared data
         self.data_lock.acquire()
         if self.queue.qsize() == 0:
-            for k in range(len(walk_list)):
-                if k < self.start_pos:
-                    continue
-                self.queue.put(walk_list[k])
+            random.shuffle(self.walk_list)
+            for k in range(len(self.walk_list)):
+                self.queue.put(self.walk_list[k])  # a queue for random points
 
         self.start_time = datetime.datetime.now()
         if self.mission_type == 0 and self.reverse == 0:
+            try:
+                f = open('robot_'+str(self.level)+'.json')
+                data = json.loads(f.read())
+                f.close()
+                print 'get last data'
+                key_list = data.keys()
+                key_list.remove('lv')
+                key_list.remove('line')
+                key_list.remove('row')
+                for each in key_list:
+                    count = data[each]
+                    each = each.replace('(', '').replace(')', '').replace(' ', '')
+                    i = int(each.split(',')[0])
+                    j = int(each.split(',')[1])
+                    # print '%d, %d %d' % (i, j, count)
+                    self.q_hc[self.row*i + j] = count
+                    self.q_wp[self.n_wp.value] = (i, j, count)
+                    self.n_wp.value += 1
+                self.sum_walk.value = self.n_wp.value
+            except IOError, e:
+                print 'no last data'
+                for i in range(self.test_num):
+                    if self.queue.qsize > 0:
+                        self.q_wc.put(self.queue.get())  # init first test points for summary calc
+                    else:
+                        break
             print 'lv:%s start time: %s' % (self.level, self.start_time.strftime("%Y%m%d-%H%M%S.%f"))
             print self.arg
-            print self.line, self.row
-            self.print_house(self.house)
+            print 'line: %d\trow: %d' % (self.line, self.row)
+            print 'test_num: %d/%d, %f' % (self.test_num, self.total_queue, self.percent)
+            ProcRobot.print_house(self.house)
+            self.syn.value = 1
         self.data_lock.release()
 
-
-    def print_house(self, temp_house):
-        print '   ',
+    @staticmethod
+    def print_house(temp_house):
+        print ' '*2+'\t',
         for j in range(len(temp_house[0])):
-            print '%3d ' % j,
+            print '%2d\t' % j,
         print ' '
         for i in range(len(temp_house)):
             each = temp_house[i]
-            print '%3d' % i,
+            print '%2d\t' % i,
             for each2 in each:
-                print '%3d ' % each2,
+                print '%2d\t' % each2,
             print ' '
 
+    def print_array(self, temp_array):
+        print ' '*5+'\t',
+        for j in range(self.row):
+            print '%5d\t' % j,
+        print ' '
+        for i in range(self.line):
+            print '%5d\t' % i,
+            for k in range(self.row):
+                print '%5d\t' % (temp_array[self.row*i + k]),
+            print ' '
 
-    #count one position value
-    def posCount(self, temp_house, i, j, temp_num_map, firstInit=False):
+    def get_value(self):
+        result = self.syn.value
+        if result == 0:
+            with self.wait_num.get_lock():
+                self.wait_num.value += 1
+            while True:
+                time.sleep(5)
+                result = self.syn.value
+                if result != 0:
+                    with self.wait_num.get_lock():
+                        self.wait_num.value -= 1
+                        # print '(%d, %d)\t\t lbg_wait %d -> %d' % (self.mission_type, self.reverse, self.wait_num.value+1, self.wait_num.value)
+                    break
+        return result
+
+    @staticmethod
+    def make_test(x, y, p):
+        result = 1
+        mult = (1 - 81.0/(x*y))*(1 - 81.0/(x*y - 1))
+        while mult > p:
+            result += 1
+            mult *= (1 - 81.0/(x*y - result))
+        return result
+
+    # count one position value
+    def pos_count(self, temp_house, i, j, temp_num_map, firstInit=False):
 
         n = 0
         if i-1 >= 0 and temp_house[i-1][j] >= 0:
@@ -163,8 +260,7 @@ class ProcRobot(multiprocessing.Process):
         temp_num_map['num_'+str(n)] += 1
         temp_house[i][j] = n
 
-
-    def multiArea(self, temp_house, block_line, block_row):
+    def multi_area(self, temp_house, block_line, block_row):
 
         #wave all blocks, and check if A-B==0 or A-B==2
         #wide is highest when travelling
@@ -180,14 +276,14 @@ class ProcRobot(multiprocessing.Process):
             block_now[block_line][block_row] = -2
             if block_line == 0 or block_line == self.line-1 or block_row == 0 or block_row == self.row-1:
                 search_wall['wall-2'] = 1
-            result = self.travelBlock(block_now, selected_list, search_wall)
+            result = self.travel_block(block_now, selected_list, search_wall)
         except RuntimeError, e:
             print 'error', e
             result = False
 
         #analyse wall to wall
         if not result:
-            result = self.analyzeMulti(block_now)
+            result = self.analyze_multi(block_now)
             if result:
                 #print 'analyse block true'
                 #print_house(block_now)
@@ -203,8 +299,7 @@ class ProcRobot(multiprocessing.Process):
 
         return result
 
-
-    def travelBlock(self, block_now, selected_list, search_wall):
+    def travel_block(self, block_now, selected_list, search_wall):
 
         if len(selected_list) == 0:
             return False
@@ -305,10 +400,10 @@ class ProcRobot(multiprocessing.Process):
                     #print (-1 - depth), '2->Ture'
                     return True
 
-        return self.travelBlock(block_now, selected_list, search_wall)
+        return self.travel_block(block_now, selected_list, search_wall)
 
-
-    def analyzeMulti(self, block_now):
+    # travel 4 walls to analyze
+    def analyze_multi(self, block_now):
 
         target = 0
         searching = True
@@ -399,11 +494,13 @@ class ProcRobot(multiprocessing.Process):
 
         return False
 
-
-    def areYouOK(self, temp_house, block_line, block_row, temp_num_map, depth):
+    def are_you_ok(self, temp_house, block_line, block_row, temp_num_map, depth):
 
         num_1, num0, num1, num2, num3, num4 = (temp_num_map['num_-1'], temp_num_map['num_0'], temp_num_map['num_1'], temp_num_map['num_2'], temp_num_map['num_3'], temp_num_map['num_4'])
         #print num_1, num0, num1, num2, num3, num4
+
+        if self.score < num_1:
+            self.score = num_1
 
         #sure
         if num0 == 1 and num1 == 0 and num2 == 0 and num3 == 0 and num4 == 0:
@@ -414,23 +511,19 @@ class ProcRobot(multiprocessing.Process):
             return False
         if num0 == 0 and num3 == 0 and num4 == 0:
             return None
-        #if num_1*4>self.line*self.row and num_1*2<self.line*self.row and block_line!=None and block_row!=None and multiArea(temp_house, block_line, block_row):
+        #if num_1*4>self.line*self.row and num_1*2<self.line*self.row and block_line!=None and block_row!=None and multi_area(temp_house, block_line, block_row):
         #    return False
         if depth % 16 == 0:
-            if self.multiArea(temp_house, block_line, block_row):
+            if self.multi_area(temp_house, block_line, block_row):
                 return False
-            self.data_lock.acquire()
-            result_size = self.result.qsize()
-            self.data_lock.release()
-            if result_size == 1:
+            if self.syn.value == 4:
                 # print self.name + ' other'
                 return False
 
         #possibly
         return None
 
-
-    def robotStart(self):
+    def robot_start(self):
 
         #origin_house at self.house_list[0]
 
@@ -462,29 +555,219 @@ class ProcRobot(multiprocessing.Process):
                 print self.name+' break1'
                 break
 
-            if i != -1 and j != -1 and result_size == 0:
-                self.sum_walk += 1
+            if i != -1 and j != -1:  # and result_size == 0:
+                with self.sum_walk.get_lock():
+                    self.sum_walk.value += 1
                 # print '%d,%d\r' % (i, j),
                 print '(%d, %d)\twalk\t%d, %d\t%s%d/%d' \
                       % (self.mission_type, self.reverse, i, j,
                          '+' if self.reverse == 0 else '-', self.total_queue-queue_size, self.total_queue)
                 self.history = ''
-                result = self.travel_first(i, j, 1)
+                self.score = 0
+                self.count_wall[self.row*i + j] = self.score
+                result = self.travel(i, j, 1)
+                self.count_wall[self.row*i + j] = self.score
                 if result[0]:
                     url = 'http://www.qlcoder.com/train/crcheck?x='+str(i+1)+'&y='+str(j+1)+'&path='+self.history
                     print url
-                    self.sum_second += timing.stop(bPrint=False)
                     return url
             else:
                 print self.name+' break2'
                 break
-        self.sum_second += timing.stop(bPrint=False)
+
+        # if self.mission_type == 0 and self.reverse == 0:
+        #     self.print_array(self.count_wall)
 
         return None
 
+    def proc_q_wc(self):
 
-    #move from (pos_line, pos_row)
-    #return (result, (ul, ur, dl, dr))
+        self.house_list.append((copy.deepcopy(self.house), copy.deepcopy(self.num_map)))
+
+        while True:
+            i, j = (-1, -1)
+            self.data_lock.acquire()
+            result_size = self.result.qsize()
+            q_wc_size = self.q_wc.qsize()
+            if q_wc_size > 0:
+                i, j = self.q_wc.get()
+                self.data_lock.release()
+            else:
+                self.data_lock.release()
+                if self.rule[0] == -1 and self.n_wp.value >= self.test_num:
+                    # syn 1 -> 2, all other proc is done
+                    test_list = list()
+                    for i in range(self.n_wp.value):
+                        test_list.append(self.q_wp[i].count)
+                    test_list.sort()
+                    # print test_list
+                    # print 'rule: %d %d %d %d %d' % (self.n_wp.value, len(test_list), int(0.29*self.test_num), int(0.89*self.test_num), int(0.99*self.test_num))
+                    self.rule[0] = test_list[int(0.29*self.n_wp.value)]
+                    self.rule[1] = test_list[int(0.89*self.n_wp.value)]
+                    self.rule[2] = test_list[int(0.99*self.n_wp.value)]
+                    print 'rule: %d %d %d' % (self.rule[0], self.rule[1], self.rule[2])
+                self.pick_seek()
+                return None
+
+            if i != -1 and j != -1 and result_size == 0:
+                with self.sum_walk.get_lock():
+                    self.sum_walk.value += 1
+                # print '%d,%d\r' % (i, j),
+                print '(%d, %d)\twalk\t%d, %d\t%d/%d' \
+                      % (self.mission_type, self.reverse, i, j, self.sum_walk.value, self.total_queue)
+                self.history = ''
+                self.score = 0
+                self.count_wall[self.row*i + j] = self.score
+                result = self.travel(i, j, 1)
+                self.count_wall[self.row*i + j] = self.score
+                # print self.score
+                self.data_lock.acquire()
+                self.q_hc[self.row*i + j] = self.score
+                self.q_wp[self.n_wp.value] = (i, j, self.score)
+                self.n_wp.value += 1
+                self.data_lock.release()
+                if result[0]:
+                    url = 'http://www.qlcoder.com/train/crcheck?x='+str(i+1)+'&y='+str(j+1)+'&path='+self.history
+                    print url
+                    # self.sum_second += timing.stop(bPrint=False)
+                    return url
+            else:
+                print self.name+' break2'
+                break
+        return None
+
+    def pick_seek(self):
+        # pick a point from q_wp
+        result = 0
+        if self.rule[0] == -1:
+            # no rule
+            i, j = self.queue.get()
+            while self.q_hc[self.row*i + j] > 0:
+                i, j = self.queue.get()
+            self.q_wc.put((i, j))
+            print '(%d, %d) pick %d, %d random no rule' % (self.mission_type, self.reverse, i, j)
+            return
+        self.data_lock.acquire()
+        wp_list = dict()
+        for i in range(self.n_wp.value):
+            each = self.q_wp[i]
+            if each.count != -1:
+                wp_list[str(each.count)] = (each.line, each.row, i)
+        wp_keys = wp_list.keys()
+        int_wp_keys = [int(i) for i in wp_keys]
+        int_wp_keys.sort()
+
+        # seek from the point
+        if int(int_wp_keys[-1]) < self.rule[0]:
+            # < 30%
+            self.data_lock.release()
+            i, j = self.queue.get()
+            while self.q_hc[self.row*i + j] > 0:
+                i, j = self.queue.get()
+            self.q_wc.put((i, j))
+            print '(%d, %d) pick %d, %d random' % (self.mission_type, self.reverse, i, j)
+            return
+
+        result = wp_list[str(int_wp_keys[-1])]
+
+        # del the point in q_wp
+        self.q_wp[result[2]].count = -1
+
+        # insert into q_hp
+        line = result[0]
+        row = result[1]
+        self.q_hp[self.n_hp.value] = (line, row, -1)
+        with self.n_hp.get_lock():
+            self.n_hp.value += 1
+        self.data_lock.release()
+
+        if int(int_wp_keys[-1]) < self.rule[1]:
+            print '(%d, %d) pick %d, %d %d horse' % (self.mission_type, self.reverse, result[0], result[1], int_wp_keys[-1])
+            # 30 ~ 90, horse
+            i, j = line-2, row-1
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line-2, row+1
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line+2, row-1
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line+2, row+1
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line-1, row-2
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line+1, row-2
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line-1, row+2
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line+1, row+2
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+        elif int(int_wp_keys[-1]) < self.rule[2]:
+            print '(%d, %d) pick %d, %d %d horse+cross' % (self.mission_type, self.reverse, result[0], result[1], int_wp_keys[-1])
+            # 90 ~ 99, horse+cross
+            i, j = line-2, row-1
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line-2, row+1
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line+2, row-1
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line+2, row+1
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line-1, row-2
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line+1, row-2
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line-1, row+2
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line+1, row+2
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            # cross
+            i, j = line-1, row
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line+1, row
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line, row-1
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+            i, j = line, row+1
+            if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                self.q_wc.put((i, j))
+        else:
+            print '(%d, %d) pick %d, %d %d square' % (self.mission_type, self.reverse, result[0], result[1], int_wp_keys[-1])
+            # > 99, big square
+            for m in range(-2, 3):
+                for n in range(-2, 3):
+                    i, j = line+m, row+n
+                    if self.test_point(i, j) is True and self.house[i][j] != -1 and self.q_hc[self.row*i + j] == -1:
+                        self.q_wc.put((i, j))
+        return
+
+    def test_point(self, line, row, wall_distance=0):
+        if line - wall_distance < 0 or line + wall_distance >= self.line:
+            return False
+        elif row - wall_distance < 0 or row + wall_distance >= self.row:
+            return False
+        else:
+            return True
+
+    # move from (pos_line, pos_row)
+    # return (result, (ul, ur, dl, dr))
     def travel_first(self, pos_line, pos_row, depth):
 
         result = (False, ((0, 0), (0, 0)))
@@ -514,7 +797,7 @@ class ProcRobot(multiprocessing.Process):
             for i in range(pos_line-inc if pos_line-inc>=0 else 0, (pos_line+2) if pos_line+1<self.line else self.line):
                 for j in [pos_row-1, pos_row, pos_row+1] if pos_row-1>=0 and pos_row+1<self.row else [pos_row-1, pos_row] if pos_row-1>0 else [pos_row, pos_row+1] if pos_row+1<self.row else [pos_row,]:
                     if house_up[i][j] >= 0:
-                        self.posCount(house_up, i, j, num_map_up)
+                        self.pos_count(house_up, i, j, num_map_up)
                         if house_up[i][j] == 0 or house_up[i][j] == 1:
                             no_shadow = True
             self.history = self.history[:depth-1]+'u'
@@ -551,7 +834,7 @@ class ProcRobot(multiprocessing.Process):
             for i in range(pos_line-1 if pos_line-1>=0 else 0, (pos_line+inc) if pos_line+inc<self.line else self.line):
                 for j in [pos_row-1, pos_row, pos_row+1] if pos_row-1>=0 and pos_row+1<self.row else [pos_row-1, pos_row] if pos_row-1>0 else [pos_row, pos_row+1] if pos_row+1<self.row else [pos_row,]:
                     if house_down[i][j] >= 0:
-                        self.posCount(house_down, i, j, num_map_down)
+                        self.pos_count(house_down, i, j, num_map_down)
                         if house_down[i][j] == 0 or house_down[i][j] == 1:
                             no_shadow = True
             self.history = self.history[:depth-1]+'d'
@@ -590,7 +873,7 @@ class ProcRobot(multiprocessing.Process):
             for i in [pos_line-1, pos_line, pos_line+1] if pos_line-1>=0 and pos_line+1<self.line else [pos_line-1, pos_line] if pos_line-1>0 else [pos_line, pos_line+1] if pos_line+1<self.line else [pos_line,]:
                 for j in range(pos_row-inc if pos_row-inc>=0 else 0, (pos_row+2) if pos_row+1<self.row else self.row):
                     if house_left[i][j] >= 0:
-                        self.posCount(house_left, i, j, num_map_left)
+                        self.pos_count(house_left, i, j, num_map_left)
                         if house_left[i][j] == 0 or house_left[i][j] == 1:
                             no_shadow = True
             self.history = self.history[:depth-1]+'l'
@@ -627,7 +910,7 @@ class ProcRobot(multiprocessing.Process):
             for i in [pos_line-1, pos_line, pos_line+1] if pos_line-1>=0 and pos_line+1<self.line else [pos_line-1, pos_line] if pos_line-1>0 else [pos_line, pos_line+1] if pos_line+1<self.line else [pos_line,]:
                 for j in range(pos_row-1 if pos_row-1>0 else 0, (pos_row+inc) if pos_row+inc<self.row else self.row):
                     if house_right[i][j] >= 0:
-                        self.posCount(house_right, i, j, num_map_right)
+                        self.pos_count(house_right, i, j, num_map_right)
                         if house_right[i][j] == 0 or house_right[i][j] == 1:
                             no_shadow = True
             self.history = self.history[:depth-1]+'r'
@@ -648,19 +931,17 @@ class ProcRobot(multiprocessing.Process):
 
         return result
 
-
-    #move from (pos_line, pos_row)
-    #return (result, (ul, dr))
+    # move from (pos_line, pos_row)
+    # return (result, (ul, dr))
     def travel(self, pos_line, pos_row, depth):
 
         result = (False, ((0, 0), (0, 0)))
         this_shadow = ((pos_line, pos_row), (pos_line, pos_row))#ul, dr
-        #this_shadow_line = {'ul': {'line': pos_line, 'row': pos_row}, 'dr': {'line': pos_line, 'row': pos_row}}#ul, dr
         this_shadow_line = [0, 0, 0, 0]#for up, down, left, right count
         a_house, a_num_map = self.house_list[depth-1]
         house_now = copy.deepcopy(a_house)
         num_map_now = copy.deepcopy(a_num_map)
-        ok = self.areYouOK(house_now, pos_line, pos_row, num_map_now, depth)
+        ok = self.are_you_ok(house_now, pos_line, pos_row, num_map_now, depth)
         if ok==False:
             result = (False, ((pos_line, pos_row), (pos_line, pos_row)))
             return result
@@ -684,7 +965,7 @@ class ProcRobot(multiprocessing.Process):
             for i in range(pos_line-inc if pos_line-inc>=0 else 0, (pos_line+2) if pos_line+1<self.line else self.line):
                 for j in [pos_row-1, pos_row, pos_row+1] if pos_row-1>=0 and pos_row+1<self.row else [pos_row-1, pos_row] if pos_row-1>0 else [pos_row, pos_row+1] if pos_row+1<self.row else [pos_row,]:
                     if house_up[i][j] >= 0:
-                        self.posCount(house_up, i, j, num_map_up)
+                        self.pos_count(house_up, i, j, num_map_up)
             self.history = self.history[:depth-1]+'u'
             if depth % 100 == 0:
                 #print self.history
@@ -714,7 +995,7 @@ class ProcRobot(multiprocessing.Process):
             for i in range(pos_line-1 if pos_line-1>=0 else 0, (pos_line+inc) if pos_line+inc<self.line else self.line):
                 for j in [pos_row-1, pos_row, pos_row+1] if pos_row-1>=0 and pos_row+1<self.row else [pos_row-1, pos_row] if pos_row-1>0 else [pos_row, pos_row+1] if pos_row+1<self.row else [pos_row,]:
                     if house_down[i][j] >= 0:
-                        self.posCount(house_down, i, j, num_map_down)
+                        self.pos_count(house_down, i, j, num_map_down)
             self.history = self.history[:depth-1]+'d'
             if depth % 100 == 0:
                 #print self.history
@@ -744,7 +1025,7 @@ class ProcRobot(multiprocessing.Process):
             for i in [pos_line-1, pos_line, pos_line+1] if pos_line-1>=0 and pos_line+1<self.line else [pos_line-1, pos_line] if pos_line-1>0 else [pos_line, pos_line+1] if pos_line+1<self.line else [pos_line,]:
                 for j in range(pos_row-inc if pos_row-inc>=0 else 0, (pos_row+2) if pos_row+1<self.row else self.row):
                     if house_left[i][j] >= 0:
-                        self.posCount(house_left, i, j, num_map_left)
+                        self.pos_count(house_left, i, j, num_map_left)
             self.history = self.history[:depth-1]+'l'
             if depth % 100 == 0:
                 #print self.history
@@ -774,7 +1055,7 @@ class ProcRobot(multiprocessing.Process):
             for i in [pos_line-1, pos_line, pos_line+1] if pos_line-1>=0 and pos_line+1<self.line else [pos_line-1, pos_line] if pos_line-1>0 else [pos_line, pos_line+1] if pos_line+1<self.line else [pos_line,]:
                 for j in range(pos_row-1 if pos_row-1>0 else 0, (pos_row+inc) if pos_row+inc<self.row else self.row):
                     if house_right[i][j] >= 0:
-                        self.posCount(house_right, i, j, num_map_right)
+                        self.pos_count(house_right, i, j, num_map_right)
             self.history = self.history[:depth-1]+'r'
             if depth % 100 == 0:
                 #print self.history
@@ -815,6 +1096,7 @@ class ProcRobot(multiprocessing.Process):
         if l[0][1] < s[0][1]:
             return ((l[0][0], l[0][1]), (l[0][0], s[0][1]-1))
         return None
+
 
 def driver_init():
     global driver
@@ -878,25 +1160,55 @@ def make_args(dev, turn_index):
     result['data_lock'] = multiprocessing.RLock()
     if dev:
         result['arg'] = '''
-level=102&x=37&y=37&map=0010000000100111110000111000011000100001011000010000001011000100000001010000001100011000100001110011111100101000100000000100010100011011001100010100000110001000100000100000100010101000010011000100000110000001010101010000010001100010000111000110000010001100001000000111001001001000000011000010100000101110000010101101110000000100010100000100000100000110000000001000001010000100010011011001110011100000000100000000100011001000100001000111001111111110011001100001000000101100100000000110001100100011000000010110000111000010010001110101101100001000010000001001000000000010000110110010000001100111000000100111001000011100000010000000001111110011100100110011010001001111000001000001110011000000101010000111001110000110001000110001000101111000101110001000010101011010011000001111000001010000000010100101101000110111000110100011001000011010110101000000101111000001100111001100011010111000000110000000110001000100000100011000010000000111110010001000111000011101100000010000110011100000100000000000100010001000001000000100010100001000000100000100010000010000100010000000001100000011101100001110000000110001000000111100000000100111000000010010001100001111100110000111100000011000001000110010000110010011110001101000010001010001010011000011111000000001111000000011001000001000001100010001000100001110001101000001110000100011101001100010000100100000000000000000000110000100010010000
+level=100&x=36&y=37&map=000000111111100111110001110000000000001000000011110000001010011011000110000100110100111000100100100001001001000011000011000100010100010000001110000000000100000010110000111001100011111000001000011000011010001110000100000000010110100101000001110100001001000000000010011000101100110010010000100100001000011100000010011000001011001011100001100110110100011000010001110001000001000000000010000101100000001100100000000000110000001010010011110110000011111000000001000000100000001000011100010000000100001101000111110011000111000011001000100000100011100001101011101000000101100100000000000100000100000011111000010000001101110000110001000100011000101110000010001011110010100110000101110001000100000100010010010010001010111000001111001000100010011000010100010000111001100001000001010001000001100001000100010001100110001000001010000010001000101000111001001000111101110101000011110100010000100001001000000000001100111000100011010111110001100000001100011100000000100011001100000011110000111000110001011001100000110000001000000000001000100100000100001001110111111100010001001000101110110000001001000111100000010000000111000100000000101000011000101100010001110010000001110100100001000001100010000011110011100010000010000000000010011000000000000000000110000000110001000001100001110001010001010001110011001111000000000000100010001110000011100000001100
 '''
     else:
         result['arg'] = driver_getQuestion()
-    arg = result['arg'][:50]
-    line = int(arg.split('&')[1].split('=')[1])
-    row = int(arg.split('&')[2].split('=')[1])
-    result['shadow'] = multiprocessing.Array(ctypes.c_byte, [15 for i in range(line*row)])
+    arg = result['arg'][:30]
+    result['lv'] = int(arg.split('&')[0].split('=')[1])
+    result['line'] = int(arg.split('&')[1].split('=')[1])
+    result['row'] = int(arg.split('&')[2].split('=')[1])
+    line = result['line']
+    row = result['row']
 
+    result['shadow'] = multiprocessing.Array(ctypes.c_byte, [15 for i in range(line*row)])
     result['queue'] = multiprocessing.Queue(maxsize=-1)
     result['queue_reverse'] = multiprocessing.Queue(maxsize=-1)
     if turn_index == 0:
-        result['start_pos'] = (52, 780)
+        result['start_pos'] = (0, 0)
     else:
         result['start_pos'] = (0, 0)
-    print 'start_pos: %d, %d' % (result['start_pos'][0], result['start_pos'][1])
+    # print 'start_pos: %d, %d' % (result['start_pos'][0], result['start_pos'][1])
+
+    result['count_wall'] = multiprocessing.Array(ctypes.c_int32, [-1 for i in range(line*row)])
+    result['syn'] = multiprocessing.Value(ctypes.c_byte, 0)
+    result['q_wc'] = multiprocessing.Queue(maxsize=-1)  # wait count
+    result['q_hc'] = multiprocessing.Array(ctypes.c_int32, [-1 for i in range(line*row)])  # have counted
+    result['n_wp'] = multiprocessing.Value(ctypes.c_int32, 0)
+    result['q_wp'] = multiprocessing.Array(Point, [(-1, -1, -1) for i in range(line*row)])  # wait for picking
+    result['n_hp'] = multiprocessing.Value(ctypes.c_int32, 0)
+    result['q_hp'] = multiprocessing.Array(Point, [(-1, -1, -1) for i in range(line*row)])  # have picked
+    result['proc_num'] = 6  # num of all proc
+    result['wait_num'] = multiprocessing.Value(ctypes.c_int32, 0)  # num of proc waiting
+    result['sum_walk'] = multiprocessing.Value(ctypes.c_int32, 0)  # num of proc waiting
+    result['rule'] = multiprocessing.Array(ctypes.c_int32, [-1, -1, -1])
+    result['percent'] = 0.05  # percent of not any test points nearby(9*9) the result point
 
     return result
 
+
+def save_hc(lv, line, row, array):
+    f = open('robot_'+str(lv)+'.json', 'w')
+    content = dict()
+    content['lv'] = lv
+    content['line'] = line
+    content['row'] = row
+    for i in range(line*row):
+        each = array[i]
+        if each != -1:
+            content['(%d, %d)' % (i/row, i % row)] = array[i]
+    f.write(json.dumps(content, sort_keys=True, indent=4, separators=(',', ': ')))
+    f.close()
 
 
 if __name__ == '__main__':
@@ -904,17 +1216,15 @@ if __name__ == '__main__':
     if dev is False:
         driver_init()
     try:
-        m = 0
+        m = 1
         for i in range(100):
             dict_args = make_args(dev, i)
 
             #create processes
             processed = []
-            for j in range(3):
-                dict_args['mission_type'] = j
+            for j1 in range(dict_args['proc_num']):
+                dict_args['mission_type'] = j1
                 dict_args['reverse'] = 0
-                processed.append(ProcRobot(dict_args))
-                dict_args['reverse'] = 1
                 processed.append(ProcRobot(dict_args))
 
             #start processes
@@ -936,13 +1246,22 @@ if __name__ == '__main__':
                     if processed[l].is_alive():
                         index = l
                         alive += 1
+
                 if alive == 0:
+                    m = 1
                     break
-                elif alive == 1:
-                    processed[index].terminate()
+                elif len(processed) > 1 and alive == 1:
+                    processed[index].terminate()  # sometime terminate a last process doing the right pos
+                    m = 1
                     break
                 else:
-                    print 'walk alive %d %d' % (alive, m)
+                    # print 'walk alive %d %d' % (alive, m)
+                    if m % 233 == 0:
+                        dict_args['data_lock'].acquire()
+                        save_hc(dict_args['lv'], dict_args['line'], dict_args['row'], dict_args['q_hc'])
+                        dict_args['data_lock'].release()
+                        print '(main) saved'
+                    pass
                 m += 1
 
             ans = ''
